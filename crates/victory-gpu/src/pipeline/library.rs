@@ -149,20 +149,32 @@ pub(crate) fn save(now: bool) {
     }
     let blob = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if l.added == 0 && !used_changed {
             return;
         }
+        // SAFETY: a size query on the library locked for serialization.
+        let size = unsafe { l.library.GetSerializedSize() };
+        let mut buffer = Vec::new();
+        if let Err(e) = buffer.try_reserve_exact(size) {
+            if used_changed {
+                USED_CHANGED.store(true, Ordering::Relaxed);
+            }
+            tracing::warn!(bytes = size, error = %e, "host pipeline library save deferred");
+            return;
+        }
+        buffer.resize(size, 0);
         // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
-        };
+        let bytes = unsafe { l.library.Serialize(&mut buffer).map(|()| buffer) };
         match bytes {
             Ok(bytes) => {
                 l.added = 0;
                 bytes
             }
             Err(e) => {
+                if used_changed {
+                    USED_CHANGED.store(true, Ordering::Relaxed);
+                }
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 return;
             }
