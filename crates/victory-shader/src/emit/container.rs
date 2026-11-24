@@ -71,7 +71,8 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows are stably sorted by register (unallocated last), preserving
+    // element order within a row.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -89,7 +90,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -112,6 +113,23 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         out.push(0);
     }
     out
+}
+
+/// The most a mesh shader's outputs may take, in bytes (D3D12).
+pub(crate) const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
+
+/// A mesh shader's output size as the DXIL validator measures it against
+/// [`MESH_OUTPUT_LIMIT`]: 4 bytes per component of every vertex element
+/// and primitive element, times the maxima rounded up to multiples of 32.
+pub(crate) fn mesh_output_bytes(
+    vertex: &[SigElement],
+    primitive: &[SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> u64 {
+    let scalars = |els: &[SigElement]| els.iter().map(|e| u64::from(e.cols)).sum::<u64>();
+    let align = |n: u32| u64::from(n).next_multiple_of(32);
+    4 * (scalars(vertex) * align(max_vertices) + scalars(primitive) * align(max_primitives))
 }
 
 /// A resource bound by register, as `PSV0` lists it.
@@ -140,9 +158,12 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
+    /// Emit `PSVRuntimeInfo3` (52 bytes, with `EntryFunctionName`) for
+    /// validator 1.8 (required for SM 6.6 compute-shader derivatives).
+    pub valver_1_8: bool,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6).
+/// `PSV0` with runtime info version 2 (validator 1.6) or 3 (validator 1.8).
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -158,7 +179,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[48]);
+    u32s(&mut out, &[if p.valver_1_8 { 52 } else { 48 }]);
     let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
     let (min, max) = p.wave_size.map_or((0, u32::MAX), |n| (n, n));
@@ -181,6 +202,14 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[30] = p.prims.len() as u8;
     }
     out.extend(info);
+    // Names of arbitrary semantics (system values use ""), then indices.
+    let mut strings = vec![0u8];
+    if p.valver_1_8 {
+        // EntryFunctionName offset into the PSV string table ("main\0").
+        let entry_name = strings.len() as u32;
+        strings.extend_from_slice(b"main\0");
+        u32s(&mut out, &[entry_name]);
+    }
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
@@ -191,8 +220,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
-    // Names of arbitrary semantics (system values use ""), then indices.
-    let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
@@ -376,5 +403,43 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    fn element(row: u32, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: "TEXCOORD".into(),
+            index: row,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn mesh_output_size_counts_components_and_aligned_maxima() {
+        // Components, not rows: 4 + 3 + 1 (two elements share row 1) and 2.
+        let vertex = [element(0, 0, 4), element(1, 0, 3), element(1, 3, 1)];
+        let primitive = [element(0, 0, 2)];
+        assert_eq!(
+            mesh_output_bytes(&vertex, &primitive, 64, 128),
+            4 * (8 * 64 + 2 * 128)
+        );
+        // Maxima round up to multiples of 32.
+        assert_eq!(
+            mesh_output_bytes(&vertex, &primitive, 33, 1),
+            mesh_output_bytes(&vertex, &primitive, 64, 32)
+        );
+        assert_eq!(mesh_output_bytes(&[], &[], 256, 256), 0);
+        // 32 components at 256 vertices are the limit itself; a primitive
+        // output on top passes it.
+        let rows: Vec<SigElement> = (0..8).map(|r| element(r, 0, 4)).collect();
+        assert_eq!(mesh_output_bytes(&rows, &[], 256, 256), MESH_OUTPUT_LIMIT);
+        let over = mesh_output_bytes(&rows, &primitive, 256, 1);
+        assert_eq!(over, MESH_OUTPUT_LIMIT + 4 * 2 * 32);
     }
 }

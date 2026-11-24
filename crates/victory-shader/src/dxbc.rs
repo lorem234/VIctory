@@ -80,9 +80,15 @@ impl<'a> Container<'a> {
         if count > MAX_PARTS {
             return Err(ShaderError::Malformed("implausible part count"));
         }
+        // Parts follow the offset table; one inside it would read the
+        // header or the offsets as a part.
+        let table_end = HEADER_SIZE + 4 * count;
         let mut parts = Vec::with_capacity(count);
         for i in 0..count {
             let offset = u32_at(data, HEADER_SIZE + 4 * i)? as usize;
+            if offset < table_end {
+                return Err(ShaderError::Malformed("part overlaps the container header"));
+            }
             let fourcc = FourCC(
                 data.get(offset..offset + 4)
                     .ok_or(ShaderError::Malformed("part header out of bounds"))?
@@ -99,6 +105,18 @@ impl<'a> Container<'a> {
                 data: body,
             });
         }
+        // Check ranges without changing the original part order.
+        let mut ranges: Vec<_> = parts
+            .iter()
+            .map(|p| (p.offset, p.offset + 8 + p.data.len()))
+            .collect();
+
+        ranges.sort_unstable();
+
+        if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(ShaderError::Malformed("overlapping parts"));
+        }
+
         Ok(Container {
             digest,
             version,
@@ -169,6 +187,46 @@ mod tests {
     }
 
     #[test]
+    fn overlap_rejects_duplicate_offsets() {
+        let mut bytes = build(&[(FourCC::SFI0, &[0; 8]), (FourCC::HASH, &[])]);
+
+        let first = u32_at(&bytes, HEADER_SIZE).unwrap();
+
+        bytes[0x24..0x28].copy_from_slice(&first.to_le_bytes());
+
+        assert!(matches!(
+            Container::parse(&bytes),
+            Err(ShaderError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn overlap_rejects_nested_part() {
+        let mut bytes = build(&[(FourCC::SFI0, b"HASH\x00\x00\x00\x00"), (FourCC::HASH, &[])]);
+
+        let first = u32_at(&bytes, HEADER_SIZE).unwrap();
+        let nested = first + 8;
+
+        bytes[0x24..0x28].copy_from_slice(&nested.to_le_bytes());
+
+        assert!(matches!(
+            Container::parse(&bytes),
+            Err(ShaderError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn overlap_accepts_adjacent_empty_parts() {
+        let bytes = build(&[(FourCC::SFI0, &[]), (FourCC::HASH, &[])]);
+
+        let c = Container::parse(&bytes).unwrap();
+
+        assert_eq!(c.parts.len(), 2);
+        assert_eq!(c.parts[0].offset + 8, c.parts[1].offset);
+        assert!(c.parts.iter().all(|p| p.data.is_empty()));
+    }
+
+    #[test]
     fn rejects_bad_input() {
         assert_eq!(Container::parse(b"nope").unwrap_err(), ShaderError::NotDxbc);
         let mut bytes = build(&[(FourCC::SFI0, &[0; 8])]);
@@ -177,5 +235,67 @@ mod tests {
         assert!(Container::parse(&bytes).is_err());
         bytes.truncate(last);
         assert!(Container::parse(&bytes).is_err());
+    }
+
+    fn malformed(bytes: &[u8]) -> &'static str {
+        match Container::parse(bytes).unwrap_err() {
+            ShaderError::Malformed(why) => why,
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_sizes_that_disagree_with_the_data() {
+        let bytes = build(&[(FourCC::SFI0, &[0; 8])]);
+        let mut larger = bytes.clone();
+        larger[0x18..0x1C].copy_from_slice(&(bytes.len() as u32 + 1).to_le_bytes());
+        assert_eq!(malformed(&larger), "container size disagrees with data");
+        let mut smaller = bytes.clone();
+        smaller[0x18..0x1C].copy_from_slice(&(HEADER_SIZE as u32 - 1).to_le_bytes());
+        assert_eq!(malformed(&smaller), "container size disagrees with data");
+        // Bytes past the stated size are not part of the container.
+        let mut padded = bytes.clone();
+        padded.extend_from_slice(&[0xAA; 16]);
+        assert_eq!(Container::parse(&padded).unwrap().parts.len(), 1);
+    }
+
+    #[test]
+    fn rejects_implausible_part_counts() {
+        let mut bytes = build(&[]);
+        bytes[0x1C..0x20].copy_from_slice(&(MAX_PARTS as u32 + 1).to_le_bytes());
+        assert_eq!(malformed(&bytes), "implausible part count");
+        // A count whose offset table runs past the container.
+        bytes[0x1C..0x20].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(malformed(&bytes), "truncated");
+    }
+
+    #[test]
+    fn rejects_parts_out_of_bounds() {
+        let bytes = build(&[(FourCC::SFI0, &[0; 8])]);
+        let mut header = bytes.clone();
+        header[0x20..0x24].copy_from_slice(&(bytes.len() as u32 - 2).to_le_bytes());
+        assert_eq!(malformed(&header), "part header out of bounds");
+        let mut size = bytes.clone();
+        size[0x28..0x2C].copy_from_slice(&9u32.to_le_bytes());
+        assert_eq!(malformed(&size), "part data out of bounds");
+    }
+
+    #[test]
+    fn rejects_parts_inside_the_header() {
+        let bytes = build(&[(FourCC::SFI0, &[0; 8]), (FourCC::HASH, &[0; 4])]);
+        // Offset 0 would read "DXBC" as a part; the offset table's own
+        // second entry is no part either.
+        for offset in [0u32, 0x10, HEADER_SIZE as u32 + 4] {
+            let mut bad = bytes.clone();
+            bad[0x20..0x24].copy_from_slice(&offset.to_le_bytes());
+            assert_eq!(
+                malformed(&bad),
+                "part overlaps the container header",
+                "offset {offset:#x}"
+            );
+        }
+        // The first byte after the table is where parts start.
+        let c = Container::parse(&bytes).unwrap();
+        assert_eq!(c.parts[0].offset, HEADER_SIZE + 8);
     }
 }

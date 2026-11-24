@@ -208,4 +208,90 @@ mod tests {
         let bytes = build_standard(0, (6, 0), 0x100, &[0u8; 16]);
         assert!(DxilProgram::parse(&bytes).is_err());
     }
+
+    fn malformed(bytes: &[u8]) -> &'static str {
+        match DxilProgram::parse(bytes) {
+            Err(ShaderError::Malformed(why)) => why,
+            other => panic!("expected a malformed program, got {other:?}"),
+        }
+    }
+
+    fn set_u32(bytes: &mut [u8], at: usize, v: u32) {
+        bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    #[test]
+    fn bytes_past_the_program_size_are_not_its_trailer() {
+        // A part may be padded beyond the program; only the program's own
+        // bytes count, so a PC program stays standard however it is padded.
+        let mut bytes = build_standard(1, (6, 6), 0x106, &fake_bitcode());
+        bytes.extend_from_slice(b"xbop\0\0\0\0");
+        let p = DxilProgram::parse(&bytes).unwrap();
+        assert_eq!(p.kind, ShaderKind::Vertex);
+        assert_eq!(p.shader_model, (6, 6));
+        assert_eq!(p.dxil_version, 0x106);
+        assert!(p.trailer.is_empty());
+        assert!(p.is_standard_layout());
+        assert_eq!(p.xbox_extras(), XboxExtras::default());
+    }
+
+    #[test]
+    fn unknown_kinds_are_kept() {
+        let bytes = build_standard(0x40, (6, 8), 0x108, &fake_bitcode());
+        assert_eq!(
+            DxilProgram::parse(&bytes).unwrap().kind,
+            ShaderKind::Unknown(0x40)
+        );
+    }
+
+    #[test]
+    fn rejects_a_size_the_part_cannot_hold() {
+        let good = build_standard(0, (6, 0), 0x100, &fake_bitcode());
+
+        let mut bytes = good.clone();
+        set_u32(&mut bytes, 4, (good.len() / 4 + 1) as u32);
+        assert_eq!(malformed(&bytes), "program size disagrees with part size");
+
+        // Smaller than the header itself.
+        let mut bytes = good.clone();
+        set_u32(&mut bytes, 4, 5);
+        assert_eq!(malformed(&bytes), "program size disagrees with part size");
+
+        // Large enough to overflow when counted in bytes.
+        let mut bytes = good;
+        set_u32(&mut bytes, 4, u32::MAX);
+        assert_eq!(malformed(&bytes), "program size disagrees with part size");
+
+        assert!(DxilProgram::parse(&[0; 4]).is_err(), "truncated header");
+    }
+
+    #[test]
+    fn rejects_a_missing_dxil_magic() {
+        let mut bytes = build_standard(0, (6, 0), 0x100, &fake_bitcode());
+        bytes[8..12].copy_from_slice(b"DXBC");
+        assert_eq!(malformed(&bytes), "missing DXIL magic");
+    }
+
+    #[test]
+    fn rejects_bitcode_past_the_program() {
+        let bitcode = fake_bitcode();
+        let mut bytes = build_standard(0, (6, 0), 0x100, &bitcode);
+        set_u32(&mut bytes, 20, bitcode.len() as u32 + 4);
+        assert_eq!(malformed(&bytes), "bitcode out of bounds");
+
+        let mut bytes = build_standard(0, (6, 0), 0x100, &bitcode);
+        set_u32(&mut bytes, 16, u32::MAX);
+        assert_eq!(malformed(&bytes), "bitcode out of bounds");
+    }
+
+    #[test]
+    fn rejects_bitcode_inside_the_header() {
+        // An offset of 4 puts the bitcode on the DXIL version field. With
+        // LLVM's magic written there, only the offset check stops the
+        // header being read as bitcode.
+        let mut bytes = build_standard(0, (6, 0), 0x100, &fake_bitcode());
+        bytes[12..16].copy_from_slice(&LLVM_BITCODE_MAGIC);
+        set_u32(&mut bytes, 16, 4);
+        assert_eq!(malformed(&bytes), "bitcode offset too small");
+    }
 }

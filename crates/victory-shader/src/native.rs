@@ -99,6 +99,8 @@ const RECORD_LAYOUT: usize = 0x28;
 const RECORD_USED: usize = 0x30;
 const RECORD_COUNTS: usize = 0x38;
 const ENTRY_SIZE: u64 = 20;
+/// `s0`-`s105`: the SGPRs a program can address (106 on is VCC).
+const SGPRS: u32 = 106;
 const MAX_SEMANTICS: u32 = 32;
 const PS_INPUTS: usize = 0x24;
 const PS_INPUT_COUNT: usize = 0x124;
@@ -117,6 +119,10 @@ const VS_OUTPUTS: usize = 0xc8;
 const VS_OUTPUT_COUNT: usize = 0x188;
 const CS_RSRC2: usize = 0x24;
 const CS_THREADS: usize = 0x28;
+/// D3D12's `numthreads` limits: x and y up to 1024, z up to 64, and at
+/// most 1024 threads in the group.
+const MAX_GROUP: [u32; 3] = [1024, 1024, 64];
+const MAX_GROUP_THREADS: u64 = 1024;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
@@ -319,9 +325,11 @@ impl ComputeIo {
         (ids, take(10))
     }
 
-    /// Thread id components in v0, v1, v2 (1 to 3).
+    /// Thread id components in v0, v1, v2 (1 to 3). `TIDIG_COMP_CNT` is a
+    /// 2-bit field, but a group id has only three components: 3 loads x, y
+    /// and z like 2 does.
     pub fn thread_id_vgprs(&self) -> u8 {
-        (self.rsrc2 >> 11 & 3) as u8 + 1
+        (self.rsrc2 >> 11 & 3).min(2) as u8 + 1
     }
 
     /// LDS bytes per thread group (512-byte granules).
@@ -493,7 +501,15 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 user_data: e[16],
                 slot: e[17],
             })
-            .collect();
+            .collect::<Vec<RootParam>>();
+        // A parameter's SGPRs must exist: `user_sgpr` and the high half of a
+        // root descriptor are computed from these bytes.
+        if layout.iter().any(|p| {
+            let first = u32::from(p.user_data) + u32::from(stage.user_sgpr(0));
+            u64::from(first) + u64::from(p.sgprs.max(1)) > u64::from(SGPRS)
+        }) {
+            return Err(Malformed("root parameter outside the SGPRs"));
+        }
         let used = table(RECORD_USED, RECORD_COUNTS + 4)?
             .as_chunks::<{ ENTRY_SIZE as usize }>()
             .0
@@ -519,14 +535,10 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         let stage_data = &payload[(start + RECORD_SIZE) as usize..];
         let io = match stage {
             HwStage::Ps => ps_io(stage_data, code.len())?,
-            HwStage::Vs => vs_io(stage_data)?,
+            HwStage::Vs => vs_inputs_fit(vs_io(stage_data)?)?,
             HwStage::Cs => StageIo::Cs(ComputeIo {
                 rsrc2: u32_at(stage_data, CS_RSRC2)?,
-                threads: [
-                    u32_at(stage_data, CS_THREADS)?,
-                    u32_at(stage_data, CS_THREADS + 4)?,
-                    u32_at(stage_data, CS_THREADS + 8)?,
-                ],
+                threads: group_size(stage_data)?,
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
             _ => StageIo::None,
@@ -542,6 +554,27 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         });
     }
     Ok(out)
+}
+
+/// A compute program's thread-group size. Lowering multiplies the
+/// components and writes them as the DXIL `numthreads`, so each must be one
+/// that HLSL allows: a zero or oversized group is refused here rather than
+/// overflowing that product (a debug panic) or emitting an invalid shader.
+fn group_size(data: &[u8]) -> Result<[u32; 3], ShaderError> {
+    let mut threads = [0; 3];
+    for (k, n) in threads.iter_mut().enumerate() {
+        *n = u32_at(data, CS_THREADS + 4 * k)?;
+    }
+    // Each component is checked first, so the product fits a u64.
+    if threads
+        .iter()
+        .zip(MAX_GROUP)
+        .any(|(&n, max)| n == 0 || n > max)
+        || threads.iter().map(|&n| u64::from(n)).product::<u64>() > MAX_GROUP_THREADS
+    {
+        return Err(Malformed("implausible thread-group size"));
+    }
+    Ok(threads)
 }
 
 /// The entries of `size` bytes from `at`, with their count at `count_at`.
@@ -629,6 +662,21 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
     Ok(StageIo::Vs { inputs, outputs })
 }
 
+/// Raising loads a vertex input's channel `c` from `v[vgpr + c]`, an 8-bit
+/// register number: every enabled channel must land on a VGPR.
+fn vs_inputs_fit(io: StageIo) -> Result<StageIo, ShaderError> {
+    if let StageIo::Vs { inputs, .. } = &io
+        && inputs.iter().any(|i| {
+            i.mask
+                .checked_ilog2()
+                .is_some_and(|last| u32::from(i.vgpr) + last > u32::from(u8::MAX))
+        })
+    {
+        return Err(Malformed("vertex input outside the VGPRs"));
+    }
+    Ok(io)
+}
+
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
     let StageIo::Vs { outputs, .. } = vs_io(data)? else {
         unreachable!()
@@ -709,7 +757,14 @@ mod tests {
             payload.extend_from_slice(&flags.to_le_bytes());
             payload.resize(record as usize + RECORD_REGS, 0);
             payload.extend_from_slice(&(VGPRS | 31 << 20).to_le_bytes());
-            payload.extend_from_slice(&empty_stage_data());
+            let mut data = empty_stage_data();
+            if stage == HwStage::Cs {
+                // numthreads(1, 1, 1): a compute group is never empty.
+                for k in 0..3 {
+                    data[CS_THREADS + 4 * k..][..4].copy_from_slice(&1u32.to_le_bytes());
+                }
+            }
+            payload.extend_from_slice(&data);
             payload.extend_from_slice(code);
         }
         let mut out = b"FSSM".to_vec();
@@ -832,6 +887,20 @@ mod tests {
             }]
         );
 
+        // Parameters must sit in SGPRs the program can address: s9 plus 97
+        // dwords ends at s105, one more is past it, and so is a user-data
+        // byte past the SGPR file.
+        let entry = FSSM_HEADER + tables as usize;
+        let layout = |blob: &[u8]| native_programs(&part(&[(KIND_NATIVE, &xbch(blob))]));
+        let mut wide = blob.clone();
+        wide[entry + 8..entry + 12].copy_from_slice(&97u32.to_le_bytes());
+        assert_eq!(layout(&wide).unwrap()[0].layout[0].sgprs, 97);
+        wide[entry + 8..entry + 12].copy_from_slice(&98u32.to_le_bytes());
+        assert!(layout(&wide).is_err());
+        let mut far = blob.clone();
+        far[entry + 16] = 0xFF;
+        assert!(layout(&far).is_err());
+
         blob[record + RECORD_COUNTS] = 9;
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_err());
     }
@@ -949,6 +1018,17 @@ mod tests {
     }
 
     #[test]
+    fn thread_id_count_three_is_still_three_components() {
+        // TIDIG_COMP_CNT (bits 11-12) of 3: still x, y and z in v0-v2,
+        // never a fourth component in v3.
+        let cs = ComputeIo {
+            rsrc2: 3 << 11,
+            threads: [4, 4, 4],
+        };
+        assert_eq!(cs.thread_id_vgprs(), 3);
+    }
+
+    #[test]
     fn reads_every_native_blob() {
         let es = xbch(&fssm(&[(HwStage::Es, &VS_CODE)]));
         let vs = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
@@ -988,5 +1068,221 @@ mod tests {
         let at = FSSM_HEADER + slot(HwStage::Ls);
         bad_record[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&bad_record))])).is_err());
+    }
+
+    /// Why `data` (a `DXIL` part) is refused.
+    fn refused(data: &[u8]) -> &'static str {
+        match native_programs(data) {
+            Err(Malformed(why)) => why,
+            other => panic!("expected a malformed blob, got {other:?}"),
+        }
+    }
+
+    /// Why a part holding `blob` as its only native entry is refused.
+    fn refused_blob(blob: &[u8]) -> &'static str {
+        refused(&part(&[(KIND_NATIVE, blob)]))
+    }
+
+    #[test]
+    fn names_each_xdat_refusal() {
+        let native = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        let mut data = part(&[(KIND_NATIVE, &native)]);
+        data[XDAT_OFFSET + 4..][..4].copy_from_slice(&(MAX_XDAT_ENTRIES as u32 + 1).to_le_bytes());
+        assert_eq!(refused(&data), "implausible XDAT entry count");
+
+        // A native entry whose size runs past the part.
+        let mut data = part(&[(KIND_NATIVE, &native)]);
+        let size = XDAT_OFFSET + 12 + 8;
+        data[size..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(refused(&data), "XDAT entry out of bounds");
+
+        // Entries of other kinds are never read, so their bounds do not matter.
+        let mut data = part(&[(0x0e, b"tbl."), (KIND_NATIVE, &native)]);
+        data[size..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(native_programs(&data).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn names_each_xbch_refusal() {
+        let good = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        let with = |at: usize, value: &[u8]| {
+            let mut blob = good.clone();
+            blob[at..at + value.len()].copy_from_slice(value);
+            blob
+        };
+        assert_eq!(
+            refused_blob(&with(0, b"XBCX")),
+            "native blob lacks XBCH magic"
+        );
+        assert_eq!(
+            refused_blob(&with(4, &(XBCH_VERSION + 1).to_le_bytes())),
+            "unknown XBCH version"
+        );
+        assert_eq!(
+            refused_blob(&with(16, &(MAX_UNPACKED + 1).to_le_bytes())),
+            "implausible XBCH unpacked size"
+        );
+        let packed = u64_at(&good, 8).unwrap();
+        assert_eq!(
+            refused_blob(&with(8, &(packed + 1).to_le_bytes())),
+            "XBCH stream out of bounds"
+        );
+        // A stated size either side of what the stream holds.
+        let unpacked = u64_at(&good, 16).unwrap();
+        for stated in [unpacked - 1, unpacked + 1] {
+            assert_eq!(
+                refused_blob(&with(16, &stated.to_le_bytes())),
+                "XBCH stream does not inflate to its stated size"
+            );
+        }
+        // A header with no stream after it.
+        assert_eq!(refused_blob(&good[..20]), "truncated");
+    }
+
+    #[test]
+    fn names_each_fssm_header_refusal() {
+        let good = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let with = |at: usize, value: &[u8]| {
+            let mut blob = good.clone();
+            blob[at..at + value.len()].copy_from_slice(value);
+            xbch(&blob)
+        };
+        assert_eq!(
+            refused_blob(&with(0, b"FSSX")),
+            "native blob lacks FSSM magic"
+        );
+        assert_eq!(
+            refused_blob(&with(4, &(FSSM_VERSION + 1).to_le_bytes())),
+            "unknown FSSM version"
+        );
+        let payload = (good.len() - FSSM_HEADER) as u64;
+        assert_eq!(
+            refused_blob(&with(8, &(payload - 1).to_le_bytes())),
+            "FSSM payload size disagrees"
+        );
+        assert_eq!(
+            refused_blob(&with(FSSM_HEADER, &(GRAPHICS_SLOT_COUNT + 1).to_le_bytes())),
+            "unexpected FSSM slot count"
+        );
+        assert_eq!(
+            refused_blob(&with(
+                FSSM_HEADER + slot(HwStage::Vs),
+                &payload.to_le_bytes()
+            )),
+            "FSSM record out of bounds"
+        );
+    }
+
+    #[test]
+    fn names_each_record_refusal() {
+        let good = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let record = stage_data_at(&good, HwStage::Vs) - RECORD_SIZE as usize;
+        let with = |at: usize, value: &[u8]| {
+            let mut blob = good.clone();
+            blob[at..at + value.len()].copy_from_slice(value);
+            xbch(&blob)
+        };
+        // One byte more code than the payload holds.
+        assert_eq!(
+            refused_blob(&with(record + 8, &(VS_CODE.len() as u64 + 1).to_le_bytes())),
+            "native code out of bounds"
+        );
+        assert_eq!(
+            refused_blob(&with(record + RECORD_REGS, &257u32.to_le_bytes())),
+            "implausible VGPR count"
+        );
+        // 256 is the most a program can have.
+        let blob = with(record + RECORD_REGS, &256u32.to_le_bytes());
+        assert_eq!(
+            native_programs(&part(&[(KIND_NATIVE, &blob)])).unwrap()[0].vgprs,
+            256
+        );
+        // One root parameter, at an offset past the payload.
+        let mut blob = good.clone();
+        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        blob[record + RECORD_COUNTS..][..4].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(refused_blob(&xbch(&blob)), "FSSM root table out of bounds");
+    }
+
+    #[test]
+    fn names_each_stage_data_refusal() {
+        let vs = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let e = stage_data_at(&vs, HwStage::Vs);
+        for count_at in [VS_INPUT_COUNT, VS_OUTPUT_COUNT] {
+            let mut blob = vs.clone();
+            blob[e + count_at..][..4].copy_from_slice(&(MAX_SEMANTICS + 1).to_le_bytes());
+            assert_eq!(refused_blob(&xbch(&blob)), "implausible semantic count");
+        }
+        // One input in v252 or v253: x-w of v252 end at v255 and fit; from
+        // v253, w would be v256.
+        let input = |vgpr: u8, mask: u8| {
+            let mut blob = vs.clone();
+            blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+            blob[e + VS_INPUTS..][..5].copy_from_slice(&[0, 0, mask, vgpr, 0]);
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        assert!(input(252, 0xf).is_ok());
+        assert!(input(255, 0x1).is_ok());
+        assert!(input(255, 0).is_ok(), "no channel is loaded");
+        for (vgpr, mask) in [(253, 0xf), (255, 0x2)] {
+            assert!(
+                matches!(
+                    input(vgpr, mask),
+                    Err(Malformed("vertex input outside the VGPRs"))
+                ),
+                "v{vgpr} mask {mask:#x}"
+            );
+        }
+
+        let ps = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        let e = stage_data_at(&ps, HwStage::Ps);
+        let mut blob = ps.clone();
+        blob[e + PS_INPUT_COUNT..][..4].copy_from_slice(&(MAX_SEMANTICS + 1).to_le_bytes());
+        assert_eq!(refused_blob(&xbch(&blob)), "implausible semantic count");
+        let mut blob = ps.clone();
+        let size = PATCH_SLOT_DWORDS as u32 + 1;
+        blob[e + PS_PATCH_SIZE..][..4].copy_from_slice(&size.to_le_bytes());
+        assert_eq!(refused_blob(&xbch(&blob)), "implausible export patch size");
+        // A one-dword patch at the code's last dword fits; one past it does not.
+        let mut blob = ps.clone();
+        blob[e + PS_PATCH_SIZE..][..4].copy_from_slice(&1u32.to_le_bytes());
+        let last = (PS_CODE.len() / 4) as u32;
+        blob[e + PS_PATCHES..][..4].copy_from_slice(&(last - 1).to_le_bytes());
+        assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_ok());
+        blob[e + PS_PATCHES..][..4].copy_from_slice(&last.to_le_bytes());
+        assert_eq!(refused_blob(&xbch(&blob)), "export patch outside the code");
+
+        // numthreads at each limit fits; past one, or a zero component, does
+        // not. 65536 x 65536 would overflow lowering's u32 thread count.
+        let cs = fssm(&[(HwStage::Cs, &VS_CODE)]);
+        let e = stage_data_at(&cs, HwStage::Cs);
+        let group = |threads: [u32; 3]| {
+            let mut blob = cs.clone();
+            for (k, n) in threads.into_iter().enumerate() {
+                blob[e + CS_THREADS + 4 * k..][..4].copy_from_slice(&n.to_le_bytes());
+            }
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        for fits in [[1024, 1, 1], [1, 1024, 1], [1, 16, 64], [32, 32, 1]] {
+            let p = group(fits).unwrap();
+            assert!(
+                matches!(p[0].io, StageIo::Cs(ComputeIo { threads, .. }) if threads == fits),
+                "{fits:?}"
+            );
+        }
+        for bad in [
+            [0, 1, 1],
+            [1, 1, 0],
+            [1025, 1, 1],
+            [1, 1, 65],
+            [64, 32, 1],
+            [65536, 65536, 1],
+            [u32::MAX, u32::MAX, u32::MAX],
+        ] {
+            assert!(
+                matches!(group(bad), Err(Malformed("implausible thread-group size"))),
+                "{bad:?}"
+            );
+        }
     }
 }

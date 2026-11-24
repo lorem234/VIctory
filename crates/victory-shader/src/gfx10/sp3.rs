@@ -394,22 +394,54 @@ fn waitcnt(imm: u16) -> String {
     parts.join(" & ")
 }
 
+/// `s_sendmsg` operand, spelled like LLVM's AMDGPU assembler: the operation
+/// only for messages that have one, the stream only for a GS emit or cut.
+/// Bits no field accounts for leave the operand as raw hex.
 fn sendmsg(imm: u16) -> String {
     let (msg, op, stream) = (imm & 0xF, imm >> 4 & 7, imm >> 8 & 3);
+    let raw = || format!("0x{imm:04x}");
+    if imm & !0x3FF != 0 || imm & 0x80 != 0 {
+        return raw();
+    }
     let msg_name = match msg {
-        2 => "MSG_GS".into(),
-        3 => "MSG_GS_DONE".into(),
-        7 => "MSG_ORDERED_PS_DONE".into(),
-        9 => "MSG_GS_ALLOC_REQ".into(),
-        _ => msg.to_string(),
+        1 => "MSG_INTERRUPT",
+        2 => "MSG_GS",
+        3 => "MSG_GS_DONE",
+        4 => "MSG_SAVEWAVE",
+        5 => "MSG_STALL_WAVE_GEN",
+        6 => "MSG_HALT_WAVES",
+        7 => "MSG_ORDERED_PS_DONE",
+        8 => "MSG_EARLY_PRIM_DEALLOC",
+        9 => "MSG_GS_ALLOC_REQ",
+        10 => "MSG_GET_DOORBELL",
+        11 => "MSG_GET_DDID",
+        15 => "MSG_SYSMSG",
+        _ => return raw(),
     };
-    let op_name = ["GS_OP_NOP", "GS_OP_CUT", "GS_OP_EMIT", "GS_OP_EMIT_CUT"]
-        .get(usize::from(op))
-        .map_or(op.to_string(), |s| s.to_string());
-    if msg == 3 && op == 0 {
-        format!("sendmsg({msg_name}, {op_name})")
-    } else {
-        format!("sendmsg({msg_name}, {op_name}, {stream})")
+    match msg {
+        2 | 3 => {
+            let op_name =
+                ["GS_OP_NOP", "GS_OP_CUT", "GS_OP_EMIT", "GS_OP_EMIT_CUT"].get(usize::from(op));
+            match op_name {
+                Some(op_name) if op == 0 && stream == 0 => {
+                    format!("sendmsg({msg_name}, {op_name})")
+                }
+                Some(op_name) if op != 0 => format!("sendmsg({msg_name}, {op_name}, {stream})"),
+                _ => raw(),
+            }
+        }
+        15 if stream == 0 => {
+            let op_name = [
+                "SYSMSG_OP_ECC_ERR_INTERRUPT",
+                "SYSMSG_OP_REG_RD",
+                "SYSMSG_OP_HOST_TRAP_ACK",
+                "SYSMSG_OP_TTRACE_PC",
+            ]
+            .get(usize::from(op).wrapping_sub(1));
+            op_name.map_or_else(raw, |op_name| format!("sendmsg({msg_name}, {op_name})"))
+        }
+        _ if op == 0 && stream == 0 => format!("sendmsg({msg_name})"),
+        _ => raw(),
     }
 }
 
@@ -760,6 +792,31 @@ mod tests {
             one(&[0xF800_1C0F, 0x0000_0302], true),
             "exp mrt0, v2, v2, v3, v3 done compr vm"
         );
+    }
+
+    #[test]
+    fn sendmsg_names_only_the_fields_a_message_has() {
+        // s_sendmsg is SOPP opcode 0x10: 0xBF90_xxxx.
+        let msg = |imm: u32| one(&[0xBF90_0000 | imm], true);
+        assert_eq!(msg(0x0009), "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)");
+        assert_eq!(msg(0x0007), "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)");
+        assert_eq!(msg(0x0008), "s_sendmsg sendmsg(MSG_EARLY_PRIM_DEALLOC)");
+        assert_eq!(msg(0x0003), "s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_NOP)");
+        assert_eq!(msg(0x0122), "s_sendmsg sendmsg(MSG_GS, GS_OP_EMIT, 1)");
+        assert_eq!(
+            msg(0x0033),
+            "s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_EMIT_CUT, 0)"
+        );
+        assert_eq!(
+            msg(0x002F),
+            "s_sendmsg sendmsg(MSG_SYSMSG, SYSMSG_OP_REG_RD)"
+        );
+        // A NOP has no stream, a message without operations has none, an
+        // unknown id has no name: each stays raw rather than lose bits.
+        assert_eq!(msg(0x0102), "s_sendmsg 0x0102");
+        assert_eq!(msg(0x0019), "s_sendmsg 0x0019");
+        assert_eq!(msg(0x000C), "s_sendmsg 0x000c");
+        assert_eq!(msg(0x0409), "s_sendmsg 0x0409");
     }
 
     #[test]

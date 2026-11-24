@@ -4,7 +4,8 @@
 //! Word 0: address modes x, y, z (bits 0-8, 3 each), log2 of the maximum
 //! anisotropy (9-11), comparison function (12-14), reduction (29-30: 0
 //! filtering, 1 minimum, 2 maximum). Word 1: minimum and maximum LOD
-//! (0-11, 12-23, unsigned 4.8). Word 2: LOD bias (0-13, signed 5.8),
+//! (0-11, 12-23, unsigned 4.8). Word 2: LOD bias (0-13, signed 5.8; D3D12
+//! takes -16 to 15.99, so the rest of the field's range is clamped),
 //! magnification and minification filters (20-21, 22-23: point, linear,
 //! anisotropic point, anisotropic linear), mip filter (26-27: none, point,
 //! linear). Word 3: border colour (30-31: transparent black, opaque black,
@@ -13,6 +14,10 @@
 //! Comparison is the sampling instruction's, not the sampler's: the console
 //! encodes a comparison function in every sampler (D3D's default, less or
 //! equal, when unused).
+
+/// `D3D12_MIP_LOD_BIAS_MIN` and `D3D12_MIP_LOD_BIAS_MAX`: a root signature
+/// with a static sampler outside them is refused.
+const MIP_LOD_BIAS: (f32, f32) = (-16.0, 15.99);
 
 /// A static sampler in D3D12 terms; the integers are the `D3D12_FILTER`,
 /// `D3D12_TEXTURE_ADDRESS_MODE`, `D3D12_COMPARISON_FUNC` and
@@ -61,7 +66,8 @@ impl StaticSampler {
         StaticSampler {
             filter,
             address: [0, 3, 6].map(|at| address(bits(w[0], at, 3))),
-            mip_lod_bias: ((bits(w[2], 0, 14) << 18) as i32 >> 18) as f32 / 256.0,
+            mip_lod_bias: (((bits(w[2], 0, 14) << 18) as i32 >> 18) as f32 / 256.0)
+                .clamp(MIP_LOD_BIAS.0, MIP_LOD_BIAS.1),
             max_anisotropy: 1 << bits(w[0], 9, 3).min(4),
             comparison: bits(w[0], 12, 3) + 1,
             // shortcut: a custom border colour (type 3, a table entry) becomes
@@ -121,5 +127,18 @@ mod tests {
             ),
             (0x1D5, 16, 15.0)
         );
+    }
+
+    /// The bias field reaches -32 to 31.99; D3D12 refuses a static sampler
+    /// past -16 or 15.99, so those ends are clamped and the rest kept.
+    #[test]
+    fn lod_bias_stays_in_the_host_range() {
+        let bias = |field: u32| StaticSampler::from_words([0, 0, field, 0]).mip_lod_bias;
+        assert_eq!(bias(0x0FFF), 15.99, "15.996 clamps");
+        assert_eq!(bias(0x1FFF), 15.99, "31.996 clamps");
+        assert_eq!(bias(0x2000), -16.0, "-32 clamps");
+        assert_eq!(bias(0x3000), -16.0, "-16 is kept");
+        assert_eq!(bias(0x0E80), 14.5, "in range is kept");
+        assert_eq!(bias(0x3F80), -0.5, "negative in range is kept");
     }
 }
