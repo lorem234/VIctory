@@ -16,7 +16,8 @@ concurrency:
 jobs:
   build:
     name: Build and test Windows x64
-    runs-on: windows-2022
+    # The networking tests check WinHTTP exports absent from Server 2022.
+    runs-on: windows-2025
     timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
