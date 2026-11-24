@@ -34,7 +34,11 @@ jobs:
         run: cargo xtask policy
 
       - name: Run tests without game data
-        run: cargo test --locked --workspace --target x86_64-pc-windows-msvc
+        env:
+          # Hosted VMs have no dedicated GPU; avoid concurrent native GPU tests.
+          VICTORY_WARP: '1'
+          RUST_BACKTRACE: '1'
+        run: cargo test --locked --workspace --target x86_64-pc-windows-msvc -- --test-threads=1 --nocapture
 
       - name: Build release executable
         env:
