@@ -2,7 +2,7 @@ name: Windows release
 
 on:
   push:
-    branches: [main, 'test/snapshot-memory']
+    branches: [main, 'test/world-shaders']
     tags: ['v*']
   workflow_dispatch:
 
@@ -159,7 +159,7 @@ jobs:
               release = (await github.rest.repos.createRelease({
                 owner, repo, tag_name: tag, target_commitish: context.sha,
                 name: `VIctory Windows x64 — ${tag}`, body,
-                draft: true, prerelease: context.ref === 'refs/heads/test/snapshot-memory'
+                draft: true, prerelease: context.ref === 'refs/heads/test/world-shaders'
               })).data;
             }
             for (const name of ['VIctory-windows-x64.zip', 'VIctory-windows-x64-diagnostics.zip', 'SHA256SUMS.txt']) {
@@ -175,7 +175,7 @@ jobs:
             }
             if (release.draft) {
               release = (await github.rest.repos.updateRelease({
-                owner, repo, release_id: release.id, draft: false, make_latest: context.ref === 'refs/heads/test/snapshot-memory' ? 'false' : 'true'
+                owner, repo, release_id: release.id, draft: false, make_latest: context.ref === 'refs/heads/test/world-shaders' ? 'false' : 'true'
               })).data;
             }
             await core.summary

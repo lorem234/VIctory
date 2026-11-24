@@ -71,7 +71,9 @@ pub fn adapters() -> Result<Vec<String>, String> {
         let mut i = 0;
         while let Ok(a) = factory.EnumAdapters1(i) {
             let d = a.GetDesc1().map_err(err)?;
-            if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+            // The hosted runner can report the Basic Render Driver without the software flag.
+            let basic_render_driver = d.VendorId == 0x1414 && d.DeviceId == 0x008c;
+            if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && !basic_render_driver {
                 out.push(description(&d.Description));
             }
             i += 1;

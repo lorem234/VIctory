@@ -933,10 +933,11 @@ mod tests {
                     }
                 }
                 Err(e) => {
-                    assert!(wave64 && !target.runs(64), "{e}");
+                    let lanes = if wave64 { 64 } else { 32 };
+                    assert!(!target.runs(lanes), "{e}");
                     // What it replaces: the host refuses the console's
                     // wave size at pipeline creation.
-                    let any = emit_for(&compute_of(&words, true, 128), Target::ANY).unwrap();
+                    let any = emit_for(&compute_of(&words, wave64, 128), Target::ANY).unwrap();
                     assert!(host.compute_pipeline(&any).is_err());
                 }
             }
