@@ -48,6 +48,9 @@ pub(crate) struct Shadow {
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+const SNAPSHOT_POOL_BYTES: usize = 256 << 20;
+const SNAPSHOT_POOL_BUFFERS: usize = 8;
+
 /// An empty buffer with room for `n` bytes, from the pool if it has one.
 fn pooled(n: usize) -> Vec<u8> {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
@@ -65,13 +68,19 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool (at most 8 kept, the largest).
+/// Retains the largest reusable snapshots within the pool's count and
+/// commit limits. In-use snapshots remain outside this pool.
 fn give_back(v: Vec<u8>) {
+    if v.capacity() > SNAPSHOT_POOL_BYTES {
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
-    if pool.len() > 8 {
-        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        pool.truncate(8);
+    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    pool.truncate(SNAPSHOT_POOL_BUFFERS);
+    let mut retained: usize = pool.iter().map(Vec::capacity).sum();
+    while retained > SNAPSHOT_POOL_BYTES {
+        retained -= pool.pop().expect("nonempty snapshot pool").capacity();
     }
 }
 
