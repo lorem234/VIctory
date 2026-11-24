@@ -948,14 +948,22 @@ impl HostList {
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
+            (|| {
+                allocator
+                    .Reset()
+                    .map_err(|e| ("resetting the command allocator", e))?;
+                list.Reset(allocator, None)
+                    .map_err(|e| ("resetting the command list", e))?;
                 list.ResourceBarrier(&barriers);
                 list.Close()
-            })
+                    .map_err(|e| ("closing the command list", e))
+            })()
         };
-        if let Err(e) = recorded {
-            fail(format_args!("a host state prelude did not record ({e})"));
+        if let Err((operation, error)) = recorded {
+            fail(format_args!(
+                "a host state prelude did not record while {operation} ({} barriers): {error}",
+                barriers.len()
+            ));
         }
         list.cast().ok()
     }

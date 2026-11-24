@@ -46,6 +46,11 @@ jobs:
           RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --locked --release -p victory --target x86_64-pc-windows-msvc
 
+      - name: Build diagnostics executable
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --locked --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc
+
       - name: Package and smoke test
         run: |
           $ErrorActionPreference = 'Stop'
@@ -78,8 +83,19 @@ jobs:
             Pop-Location
           }
           Compress-Archive -Path "$package/*" -DestinationPath dist/VIctory-windows-x64.zip
-          $hash = (Get-FileHash dist/VIctory-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  VIctory-windows-x64.zip" | Set-Content dist/SHA256SUMS.txt -Encoding ascii
+          Copy-Item target/x86_64-pc-windows-msvc/diag/victory.exe "$package/victory.exe" -Force
+          @'
+          This build supports the diagnostics switches listed in README.md.
+          In PowerShell, set $env:VICTORY_D3D12_DEBUG = '1' before launching.
+          The Direct3D debug layer requires the Windows Graphics Tools feature.
+          For software rendering, also set $env:VICTORY_D3D12_WARP = '1'.
+          '@ | Add-Content "$package/START-HERE.txt" -Encoding utf8
+          & "./$package/victory.exe" --help
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostics executable smoke test failed' }
+          Compress-Archive -Path "$package/*" -DestinationPath dist/VIctory-windows-x64-diagnostics.zip
+          Get-FileHash dist/*.zip -Algorithm SHA256 | ForEach-Object {
+            "$($_.Hash.ToLowerInvariant())  $(Split-Path -Leaf $_.Path)"
+          } | Set-Content dist/SHA256SUMS.txt -Encoding ascii
 
       - name: Upload release files
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -87,6 +103,7 @@ jobs:
           name: windows-release
           path: |
             dist/VIctory-windows-x64.zip
+            dist/VIctory-windows-x64-diagnostics.zip
             dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14
@@ -116,11 +133,12 @@ jobs:
               : `build-${context.runNumber}-${context.sha.slice(0, 7)}`;
             const body = [
               'Automated Windows x64 build. Download **VIctory-windows-x64.zip**, extract it, and read **START-HERE.txt**.',
+              '**VIctory-windows-x64-diagnostics.zip** supports the Direct3D debug layer and other troubleshooting switches.',
               'No Rust, Visual Studio, or build dependencies need to be installed.',
               '**Project status: not playable yet.** See the included README for hardware requirements, known limitations, and GPU warnings.',
               `Source commit: ${context.sha}`,
               `Build: https://github.com/${owner}/${repo}/actions/runs/${context.runId}`,
-              'SHA256SUMS.txt contains the SHA-256 checksum of the ZIP.'
+              'SHA256SUMS.txt contains the SHA-256 checksums of both ZIPs.'
             ].join('\n\n');
             let release;
             try {
@@ -133,7 +151,7 @@ jobs:
                 draft: true, prerelease: false
               })).data;
             }
-            for (const name of ['VIctory-windows-x64.zip', 'SHA256SUMS.txt']) {
+            for (const name of ['VIctory-windows-x64.zip', 'VIctory-windows-x64-diagnostics.zip', 'SHA256SUMS.txt']) {
               const existing = release.assets.find(asset => asset.name === name);
               if (existing) {
                 if (!release.draft) continue;
