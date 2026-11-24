@@ -2,7 +2,7 @@ name: Windows release
 
 on:
   push:
-    branches: [main, 'test/packed-targets']
+    branches: [main, 'test/world-bounds']
     tags: ['v*']
   workflow_dispatch:
 
@@ -43,8 +43,8 @@ jobs:
           $code = $LASTEXITCODE
           Get-Content "$env:RUNNER_TEMP/tests.log" -Tail 75
           if ($code -ne 0) {
-            $errors = Select-String -Path "$env:RUNNER_TEMP/tests.log" -Pattern 'panicked at|FAILED|error\[E|error:|assertion failed|left:|right:' -Context 0,1
-            $errors | Select-Object -Last 20 | ForEach-Object {
+            $errors = Select-String -Path "$env:RUNNER_TEMP/tests.log" -Pattern 'panicked at|\.\.\. FAILED|^error\[E|^error:|assertion failed|^\s*(left|right):' -Context 0,1
+            $errors | Select-Object -Last 8 | ForEach-Object {
               $message = ($_.Line + ' ' + ($_.Context.PostContext -join ' ')) -replace '\x1b\[[0-9;]*m',''
               Write-Output "::error::$message"
             }
@@ -159,7 +159,7 @@ jobs:
               release = (await github.rest.repos.createRelease({
                 owner, repo, tag_name: tag, target_commitish: context.sha,
                 name: `VIctory Windows x64 — ${tag}`, body,
-                draft: true, prerelease: context.ref === 'refs/heads/test/packed-targets'
+                draft: true, prerelease: context.ref === 'refs/heads/test/world-bounds'
               })).data;
             }
             for (const name of ['VIctory-windows-x64.zip', 'VIctory-windows-x64-diagnostics.zip', 'SHA256SUMS.txt']) {
@@ -175,7 +175,7 @@ jobs:
             }
             if (release.draft) {
               release = (await github.rest.repos.updateRelease({
-                owner, repo, release_id: release.id, draft: false, make_latest: context.ref === 'refs/heads/test/packed-targets' ? 'false' : 'true'
+                owner, repo, release_id: release.id, draft: false, make_latest: context.ref === 'refs/heads/test/world-bounds' ? 'false' : 'true'
               })).data;
             }
             await core.summary
