@@ -43,8 +43,8 @@ jobs:
           $code = $LASTEXITCODE
           Get-Content "$env:RUNNER_TEMP/tests.log" -Tail 75
           if ($code -ne 0) {
-            $errors = Select-String -Path "$env:RUNNER_TEMP/tests.log" -Pattern 'panicked at|FAILED|error\[E|error:|assertion failed|left:|right:' -Context 0,1
-            $errors | Select-Object -Last 20 | ForEach-Object {
+            $errors = Select-String -Path "$env:RUNNER_TEMP/tests.log" -Pattern 'panicked at|\.\.\. FAILED|^error\[E|^error:|assertion failed|^\s*(left|right):' -Context 0,1
+            $errors | Select-Object -Last 8 | ForEach-Object {
               $message = ($_.Line + ' ' + ($_.Context.PostContext -join ' ')) -replace '\x1b\[[0-9;]*m',''
               Write-Output "::error::$message"
             }
