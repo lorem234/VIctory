@@ -35,11 +35,11 @@ macro_rules! once {
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
     /// Its bytes.
-    #[cfg(feature = "diagnostics")]
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
+    row_bytes: Vec<u64>,
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
@@ -52,13 +52,11 @@ pub(crate) struct Staging {
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
-    read: Vec<u8>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -176,17 +174,17 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
+    pub(crate) fn refresh(&self, tiled: &mut Vec<u8>) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let read = self.refresh_now();
+        let read = self.refresh_now(tiled);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
     /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    fn refresh_now(&self, tiled: &mut Vec<u8>) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
@@ -198,9 +196,9 @@ impl Staging {
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            tiled.resize(size, 0);
+            crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+            self.detile(tiled);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
@@ -245,14 +243,11 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let lines = rows as usize * f.Depth as usize;
-            let len = if self.widened_from.is_some() && lines > 0 {
-                // The last subresource allocation stops at the last row's used bytes.
-                pitch * (lines - 1) + f.Width as usize * 4
-            } else {
-                pitch * lines
+            let Some(len) = footprint_len(*footprint, rows, self.row_bytes[i], self.size) else {
+                tracing::warn!(mip, slice, "texture footprint exceeds its staging buffer");
+                return;
             };
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            // SAFETY: footprint_len checked the range against the mapped allocation.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -273,6 +268,25 @@ impl Staging {
             }
         }
     }
+}
+
+/// Copyable footprints omit the padding after a subresource's last row.
+fn footprint_len(
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    rows: u32,
+    row_bytes: u64,
+    allocation: u64,
+) -> Option<usize> {
+    let lines = u64::from(rows) * u64::from(footprint.Footprint.Depth);
+    let pitch = u64::from(footprint.Footprint.RowPitch);
+    if row_bytes == 0 || row_bytes > pitch {
+        return None;
+    }
+    let len = lines.checked_sub(1)?.checked_mul(pitch)?.checked_add(row_bytes)?;
+    if len > allocation.checked_sub(footprint.Offset)? {
+        return None;
+    }
+    usize::try_from(len).ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -364,6 +378,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
+    let mut row_bytes = vec![0u64; count as usize];
     let mut total = 0;
     // SAFETY: outputs for `count` subresources.
     unsafe {
@@ -374,7 +389,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             0,
             Some(footprints.as_mut_ptr()),
             Some(rows.as_mut_ptr()),
-            None,
+            Some(row_bytes.as_mut_ptr()),
             Some(&mut total),
         );
     }
@@ -388,11 +403,11 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let s = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
         size: total,
         data,
         footprints,
         rows,
+        row_bytes,
         layout,
         mips: u32::from(d.MipLevels),
         memory,
@@ -407,6 +422,21 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 mod tests {
     use super::*;
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    #[test]
+    fn staging_footprint_ends_at_the_last_rows_used_bytes() {
+        let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 512,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                RowPitch: 256,
+                Depth: 2,
+                ..Default::default()
+            },
+        };
+        assert_eq!(footprint_len(footprint, 3, 12, 1804), Some(1292));
+        assert_eq!(footprint_len(footprint, 3, 12, 1803), None);
+        assert_eq!(footprint_len(footprint, 3, 257, 4096), None);
+    }
 
     #[test]
     fn detile_widened_packed16_expands_into_rgba8_staging() {

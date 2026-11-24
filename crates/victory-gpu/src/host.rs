@@ -1668,7 +1668,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        staging.refresh(&mut batch.tiled_texture);
                     }
                     continue;
                 }
@@ -1692,6 +1692,8 @@ struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// CPU scratch for detiling one texture at a time during preparation.
+    tiled_texture: Vec<u8>,
 }
 
 impl Batch {
