@@ -191,7 +191,8 @@ pub struct UserData {
     /// `Constants` or `Table`, or `ResourceHeap` / `SamplerHeap` for a
     /// heap's guard slot (see the module notes for the value).
     pub root: RootType,
-    /// Dword within the parameter.
+    /// Dword within the parameter, or 1 for the resource heap's Texture2D
+    /// replacement for index zero.
     pub dword: u32,
 }
 

@@ -303,16 +303,18 @@ impl State {
     /// The value of user-data dword `u` of a translated shader: a root
     /// argument, or a bound heap's guard slot.
     fn user_dword(&self, compute: bool, u: &victory_shader::emit::UserData) -> u32 {
-        let guard = |samplers: bool| {
+        let bound_heap = |samplers: bool| {
             let h = self.heaps[usize::from(samplers)];
             (h != 0)
                 .then(|| crate::descriptor::heap(h as This).host())
                 .flatten()
-                .map_or(0, |h| h.guard_slot())
         };
         match u.root {
-            RootType::ResourceHeap => guard(false),
-            RootType::SamplerHeap => guard(true),
+            RootType::ResourceHeap if u.dword == 1 => {
+                bound_heap(false).map_or(0, |h| h.texture_2d_zero())
+            }
+            RootType::ResourceHeap => bound_heap(false).map_or(0, |h| h.guard_slot()),
+            RootType::SamplerHeap => bound_heap(true).map_or(0, |h| h.guard_slot()),
             _ => self.user_value(compute, u.slot, u.root, u.dword),
         }
     }

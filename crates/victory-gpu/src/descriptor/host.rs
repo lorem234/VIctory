@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -23,6 +24,8 @@ pub(crate) struct HostHeap {
     /// where the host takes them, else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
+    /// Whether a Texture2D access can use slot zero as-is.
+    zero_srv_2d: AtomicBool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
@@ -143,6 +146,7 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
+            zero_srv_2d: AtomicBool::new(true),
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
@@ -276,6 +280,14 @@ impl HostHeap {
         }
     }
 
+    pub(crate) fn texture_2d_zero(&self) -> u32 {
+        if self.zero_srv_2d.load(Ordering::Acquire) {
+            0
+        } else {
+            self.guard_slot()
+        }
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
@@ -309,6 +321,9 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
+        if index == 0 && !self.sampler {
+            self.zero_srv_2d.store(true, Ordering::Release);
+        }
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -434,6 +449,10 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
+            if index == 0 && !self.sampler {
+                let texture = kept.as_ref().and_then(Option::as_ref);
+                self.zero_srv_2d.store(is_texture_2d_srv(&view, texture), Ordering::Release);
+            }
             self.keep(index, kept.flatten());
         }
         Some(view)
@@ -456,6 +475,25 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+fn is_texture_2d_srv(view: &View, texture: Option<&ID3D12Resource>) -> bool {
+    let dimension = match view {
+        View::Shader(_, Some(desc)) => desc[1],
+        View::Placed(false, _, desc) => desc[1],
+        View::Shader(_, None) => {
+            return texture.is_none_or(|t| {
+                // SAFETY: the descriptor writer still owns the resource.
+                let desc = unsafe { t.GetDesc() };
+                desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                    && desc.DepthOrArraySize == 1
+                    && desc.SampleDesc.Count == 1
+            });
+        }
+        _ => return false,
+    };
+    dimension == D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32
+        || texture.is_none() && !(1..=10).contains(&dimension)
 }
 
 /// Logs `what` the first time it happens.
@@ -1041,5 +1079,23 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn texture_2d_reads_require_a_compatible_zero_descriptor() {
+        let srv = |dimension| {
+            let mut desc = [0; 10];
+            desc[1] = dimension;
+            View::Shader(0, Some(desc))
+        };
+        assert!(is_texture_2d_srv(
+            &srv(D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32),
+            None,
+        ));
+        assert!(!is_texture_2d_srv(
+            &srv(D3D12_SRV_DIMENSION_TEXTURE1D.0 as u32),
+            None,
+        ));
+        assert!(!is_texture_2d_srv(&View::Constant(0, 256), None));
     }
 }

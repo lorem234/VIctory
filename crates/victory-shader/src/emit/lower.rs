@@ -260,9 +260,9 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
-    /// The host's guard slots ([`Lower::heap_guard`]), view heap then
-    /// sampler heap, read once.
-    guard_slots: [Option<V>; 2],
+    /// The two heap limits and the Texture2D replacement for slot zero,
+    /// read once.
+    heap_arguments: [Option<V>; 3],
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -645,7 +645,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
-            guard_slots: [None; 2],
+            heap_arguments: [None; 3],
         }
     }
 
@@ -3703,7 +3703,7 @@ impl<'a> Lower<'a> {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
-                let h = self.s.heap_handle(self.cur, index, sampler, props);
+                let h = self.typed_heap_handle(index, sampler, props);
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -3772,7 +3772,7 @@ impl<'a> Lower<'a> {
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
-                Ok(self.s.heap_handle(self.cur, phi, sampler, props))
+                Ok(self.typed_heap_handle(phi, sampler, props))
             }
         }
     }
@@ -3829,7 +3829,29 @@ impl<'a> Lower<'a> {
     /// title or table uses, null in a view heap; any sampler in a sampler
     /// heap. Indices at or above it read it.
     fn heap_guard(&mut self, index: V, sampler: bool) -> V {
-        let guard = match self.guard_slots[usize::from(sampler)] {
+        let guard = self.heap_argument(usize::from(sampler));
+        let c = self.cur;
+        let inside = self.s.m.cmp(c, pred::IULT, index, guard);
+        self.s.m.select(c, inside, index, guard)
+    }
+
+    // Bindless Texture2D loads can get index zero from a cleared material.
+    // Slot zero is only usable if the bound heap actually has a 2D SRV there.
+    fn typed_heap_handle(&mut self, index: V, sampler: bool, props: (u32, u32)) -> V {
+        let c = self.cur;
+        let index = if !sampler && props.0 == 2 {
+            let compatible_zero = self.heap_argument(2);
+            let zero = self.s.m.i32(0);
+            let is_zero = self.s.m.cmp(c, pred::EQ, index, zero);
+            self.s.m.select(c, is_zero, compatible_zero, index)
+        } else {
+            index
+        };
+        self.s.heap_handle(c, index, sampler, props)
+    }
+
+    fn heap_argument(&mut self, argument: usize) -> V {
+        match self.heap_arguments[argument] {
             Some(g) => g,
             None => {
                 // After every user-data dword the program's parameters
@@ -3842,8 +3864,8 @@ impl<'a> Lower<'a> {
                     .map(|p| u32::from(p.user_data) + p.sgprs)
                     .max()
                     .unwrap_or(0);
-                let at = after + u32::from(sampler);
-                let root = if sampler {
+                let at = after + argument as u32;
+                let root = if argument == 1 {
                     RootType::SamplerHeap
                 } else {
                     RootType::ResourceHeap
@@ -3854,17 +3876,14 @@ impl<'a> Lower<'a> {
                         index: at,
                         slot: 0,
                         root,
-                        dword: 0,
+                        dword: u32::from(argument == 2),
                     },
                 );
                 let g = self.user_dword(at);
-                self.guard_slots[usize::from(sampler)] = Some(g);
+                self.heap_arguments[argument] = Some(g);
                 g
             }
-        };
-        let c = self.cur;
-        let inside = self.s.m.cmp(c, pred::IULT, index, guard);
-        self.s.m.select(c, inside, index, guard)
+        }
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
