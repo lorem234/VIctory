@@ -60,12 +60,18 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
+    // Reserve work without ever letting the budget counter wrap.
     uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
-        // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
+    budget.InterlockedAdd(0, 0, before);
+    [allow_uav_condition]
+    while (before < BUDGET && cost <= BUDGET - before) {
+        uint seen;
+        budget.InterlockedCompareExchange(0, before, before + cost, seen);
+        if (seen == before) return;
+        before = seen;
     }
+    // Draws keep their layout with no vertices; groups become zero.
+    args.Store(at, 0);
 }
 "#;
 
@@ -223,5 +229,32 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    #[test]
+    fn rejected_records_cannot_wrap_the_indirect_budget() {
+        let Some(host) = super::host() else { return };
+        let (args, data) = host.shared_buffer(4096).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: these 65 records fit in the mapping, before GPU use.
+        let gpu = unsafe {
+            for i in 0..65 {
+                let count = if i < 64 { 1 << 24 } else { 3u32 };
+                let instances = if i < 64 { 4 } else { 1 };
+                std::ptr::copy_nonoverlapping(
+                    [count, instances, 0, 0].as_ptr().cast::<u8>(),
+                    data.add(i * 16),
+                    16,
+                );
+            }
+            args.GetGPUVirtualAddress()
+        };
+        assert!(super::bound(&list, &args, gpu, (0, 16, 64)));
+        assert!(super::bound(&list, &args, gpu + 64 * 16, (0, 16, 1)));
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the fence has completed and the records are still mapped.
+        let surviving_vertices = unsafe { data.add(64 * 16).cast::<u32>().read_unaligned() };
+        assert_eq!(surviving_vertices, 0);
     }
 }
