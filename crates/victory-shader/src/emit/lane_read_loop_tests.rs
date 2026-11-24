@@ -137,7 +137,12 @@ fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
         for (name, host) in devices() {
             // For the host's waves: a wave64 program runs in two halves
             // where there are no 64-lane waves.
-            let cs = emit(&program(wave, lane), host.target());
+            let target = host.target();
+            if !(target.runs(wave) || wave == 64 && target.runs(32)) {
+                eprintln!("{name}: wave{wave} unsupported on this device; skipped");
+                continue;
+            }
+            let cs = emit(&program(wave, lane), target);
             let (root, pso) = host
                 .compute_pipeline(&cs)
                 .unwrap_or_else(|e| panic!("{name}: wave{wave}: {e}"));
