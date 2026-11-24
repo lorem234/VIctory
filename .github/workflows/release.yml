@@ -2,7 +2,7 @@ name: Windows release
 
 on:
   push:
-    branches: [main, 'test/pr334']
+    branches: [main, 'test/packed-targets']
     tags: ['v*']
   workflow_dispatch:
 
@@ -38,7 +38,18 @@ jobs:
           # Hosted VMs have no dedicated GPU; avoid concurrent native GPU tests.
           VICTORY_WARP: '1'
           RUST_BACKTRACE: '1'
-        run: cargo test --locked --workspace --target x86_64-pc-windows-msvc -- --test-threads=1 --nocapture
+        run: |
+          cargo test --locked --workspace --target x86_64-pc-windows-msvc -- --test-threads=1 --nocapture *> "$env:RUNNER_TEMP/tests.log"
+          $code = $LASTEXITCODE
+          Get-Content "$env:RUNNER_TEMP/tests.log" -Tail 75
+          if ($code -ne 0) {
+            $errors = Select-String -Path "$env:RUNNER_TEMP/tests.log" -Pattern 'panicked at|FAILED|error\[E|error:|assertion failed|left:|right:' -Context 0,1
+            $errors | Select-Object -Last 20 | ForEach-Object {
+              $message = ($_.Line + ' ' + ($_.Context.PostContext -join ' ')) -replace '\x1b\[[0-9;]*m',''
+              Write-Output "::error::$message"
+            }
+          }
+          exit $code
 
       - name: Build release executable
         env:
@@ -148,7 +159,7 @@ jobs:
               release = (await github.rest.repos.createRelease({
                 owner, repo, tag_name: tag, target_commitish: context.sha,
                 name: `VIctory Windows x64 — ${tag}`, body,
-                draft: true, prerelease: context.ref === 'refs/heads/test/pr334'
+                draft: true, prerelease: context.ref === 'refs/heads/test/packed-targets'
               })).data;
             }
             for (const name of ['VIctory-windows-x64.zip', 'VIctory-windows-x64-diagnostics.zip', 'SHA256SUMS.txt']) {
@@ -164,7 +175,7 @@ jobs:
             }
             if (release.draft) {
               release = (await github.rest.repos.updateRelease({
-                owner, repo, release_id: release.id, draft: false, make_latest: context.ref === 'refs/heads/test/pr334' ? 'false' : 'true'
+                owner, repo, release_id: release.id, draft: false, make_latest: context.ref === 'refs/heads/test/packed-targets' ? 'false' : 'true'
               })).data;
             }
             await core.summary
