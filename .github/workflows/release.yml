@@ -1,0 +1,152 @@
+name: Windows release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and test Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install the repository's pinned Rust toolchain
+        run: rustup show
+
+      - name: Check repository asset policy
+        run: cargo xtask policy
+
+      - name: Run tests without game data
+        run: cargo test --locked --workspace --target x86_64-pc-windows-msvc
+
+      - name: Build release executable
+        env:
+          # Include the C runtime so users do not need the Visual C++ redistributable.
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --locked --release -p victory --target x86_64-pc-windows-msvc
+
+      - name: Package and smoke test
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = 'dist/VIctory-windows-x64'
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/victory.exe $package
+          Copy-Item README.md, LICENSE, victory.example.toml $package
+          Copy-Item -Recurse docs "$package/docs"
+          @"
+          VIctory Windows x64
+          Commit: $env:GITHUB_SHA
+
+          Extract the entire ZIP to a folder, then open PowerShell there.
+          Run .\victory.exe --help for commands.
+          Copy victory.example.toml to victory.toml and set your own paths.
+          Run .\victory.exe config to check the configuration.
+          Run .\victory.exe run 'C:\path\to\game\title.exe' --execute
+
+          No Rust, Visual Studio, or build dependencies are needed.
+          Windows 10/11 x64, AVX2, a compatible Direct3D 12 GPU, and your own
+          game files are required. See README.md for hardware requirements
+          and the current status: the project is not playable yet.
+          "@ | Set-Content "$package/START-HERE.txt" -Encoding utf8
+          # Exercise the executable from its distribution folder.
+          Push-Location $package
+          try {
+            & ./victory.exe --help
+            if ($LASTEXITCODE -ne 0) { throw 'Executable smoke test failed' }
+          } finally {
+            Pop-Location
+          }
+          Compress-Archive -Path "$package/*" -DestinationPath dist/VIctory-windows-x64.zip
+          $hash = (Get-FileHash dist/VIctory-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  VIctory-windows-x64.zip" | Set-Content dist/SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-release
+          path: |
+            dist/VIctory-windows-x64.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish downloadable release
+    needs: build
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: windows-release
+          path: dist
+
+      - name: Publish ZIP and checksums
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const tag = context.ref.startsWith('refs/tags/')
+              ? context.ref.slice('refs/tags/'.length)
+              : `build-${context.runNumber}-${context.sha.slice(0, 7)}`;
+            const body = [
+              'Automated Windows x64 build. Download **VIctory-windows-x64.zip**, extract it, and read **START-HERE.txt**.',
+              'No Rust, Visual Studio, or build dependencies need to be installed.',
+              '**Project status: not playable yet.** See the included README for hardware requirements, known limitations, and GPU warnings.',
+              `Source commit: ${context.sha}`,
+              `Build: https://github.com/${owner}/${repo}/actions/runs/${context.runId}`,
+              'SHA256SUMS.txt contains the SHA-256 checksum of the ZIP.'
+            ].join('\n\n');
+            let release;
+            try {
+              release = (await github.rest.repos.getReleaseByTag({ owner, repo, tag })).data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              release = (await github.rest.repos.createRelease({
+                owner, repo, tag_name: tag, target_commitish: context.sha,
+                name: `VIctory Windows x64 — ${tag}`, body,
+                draft: true, prerelease: false
+              })).data;
+            }
+            for (const name of ['VIctory-windows-x64.zip', 'SHA256SUMS.txt']) {
+              const existing = release.assets.find(asset => asset.name === name);
+              if (existing) {
+                if (!release.draft) continue;
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: existing.id });
+              }
+              await github.rest.repos.uploadReleaseAsset({
+                owner, repo, release_id: release.id, name,
+                data: fs.readFileSync(`dist/${name}`)
+              });
+            }
+            if (release.draft) {
+              release = (await github.rest.repos.updateRelease({
+                owner, repo, release_id: release.id, draft: false, make_latest: 'true'
+              })).data;
+            }
+            await core.summary
+              .addHeading('Windows download')
+              .addLink('Download VIctory-windows-x64.zip', `https://github.com/${owner}/${repo}/releases/download/${tag}/VIctory-windows-x64.zip`)
+              .addBreak()
+              .addLink('Release details and checksum', release.html_url)
+              .write();

@@ -46,6 +46,27 @@ What each part does today and what it still needs:
 
 ## Getting started
 
+### Download a prebuilt Windows executable
+
+This fork builds and tests on GitHub Actions, then publishes a ZIP after
+every push to `main`, every `v*` tag, or a manual run on `main`.
+
+[Download the latest Windows x64 ZIP](https://github.com/lorem234/VIctory/releases/latest/download/VIctory-windows-x64.zip)
+or view [all releases](https://github.com/lorem234/VIctory/releases).
+Extract the ZIP and read `START-HERE.txt`. Run `.\victory.exe --help` in
+PowerShell from the extracted folder. Rust, Visual Studio, and build
+dependencies are not required; the hardware and game-file requirements
+below still apply. Prebuilt releases have the same limitations described
+under **Status** above.
+
+To rebuild without installing anything locally, open
+[Actions → Windows release](https://github.com/lorem234/VIctory/actions/workflows/release.yml),
+select **Run workflow**, and use the `main` branch. Once both jobs succeed,
+the download appears under Releases. No personal access token or repository
+secrets are needed; publishing uses GitHub's automatic `GITHUB_TOKEN`.
+
+### Build from source
+
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
