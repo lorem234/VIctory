@@ -7019,7 +7019,7 @@ mod tests {
         ];
         for head in bit_tests {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
-            lowers(&words).unwrap();
+            lowers(&words, 0).unwrap();
         }
     }
 
